@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Auto Set/Get Village Notes (Gestor de Notas TW - Barra de Acesso Rápido)
 // @namespace    http://tampermonkey.net/
-// @version      14.0
-// @description  Verificação em tempo real do dono atual (ignora aldeias tuas mesmo em relatórios antigos) e limpeza definitiva. Adaptado para Barra de Acesso Rápido com navegação contínua AJAX.
-// @author       RedAlert (Mod: JawJaw / Adaptado para Barra Rápida)
+// @version      15.0
+// @description  Verificação em tempo real do dono atual (ignora aldeias tuas mesmo em relatórios antigos) e limpeza definitiva. Adaptado para Barra de Acesso Rápido com navegação contínua AJAX e controlo rigoroso de tamanho de nota.
+// @author       RedAlert (Mod: JawJaw / Refatorado para Barra Rápida)
 // ==/UserScript==
 
 (() => {
@@ -16,6 +16,7 @@
         FAKE_LIMIT: 250,
         HIGH_THREAT_POP: 18000,
         FARM_CAPACITY: 24000,
+        MAX_NOTE_LENGTH: 4200, // Limite seguro para evitar rejeição do servidor TW (limite max: 5000)
         DELAYS: { MIN: 200, MAX: 400 },
         STORAGE: {
             HISTORY: `tw_notas_history_${game_data.world}`,
@@ -26,14 +27,14 @@
             CLEANED: `tw_notas_cleaned_${game_data.world}`
         },
         UNITS: {
-            POP: { spear: 1, sword: 1, axe: 1, archer: 1, spy: 2, light: 4, marcher: 5, heavy: 6, ram: 5, catapult: 8, knight: 10, snob: 100 },
+            POP: { spear: 1, sword: 1, axe: 1, archer: 1, spy: 2, light: 4, marcher: 5, heavy: 6, ram: 5, catapult: 8, knight: 10, snob: 100, militia: 0 },
             OFF: ['axe', 'light', 'marcher', 'ram', 'catapult'],
             DEF: ['spear', 'sword', 'archer', 'heavy']
         }
     };
 
     // ==========================================
-    // 2. MÓDULO DE BASE DE DADOS
+    // 2. MÓDULO DE BASE DE DADOS (LOCALSTORAGE)
     // ==========================================
     const DB = {
         getHistory: () => JSON.parse(localStorage.getItem(CFG.STORAGE.HISTORY) || '[]'),
@@ -46,11 +47,6 @@
                 if (h.length > 3000) h.shift();
                 localStorage.setItem(CFG.STORAGE.HISTORY, JSON.stringify(h));
             }
-        },
-        clearHistory: () => {
-            localStorage.removeItem(CFG.STORAGE.HISTORY);
-            if (window.UI) window.UI.SuccessMessage('Histórico de relatórios limpo com sucesso.');
-            setTimeout(() => location.reload(), 500);
         },
 
         getOwned: () => JSON.parse(localStorage.getItem(CFG.STORAGE.OWNED) || '[]'),
@@ -113,8 +109,20 @@
             delete db[id];
             localStorage.setItem(CFG.STORAGE.DB, JSON.stringify(db));
         },
+
         isRunning: () => localStorage.getItem(CFG.STORAGE.STATE) === 'true',
-        setState: (state) => localStorage.setItem(CFG.STORAGE.STATE, state ? 'true' : 'false')
+        setState: (state) => localStorage.setItem(CFG.STORAGE.STATE, state ? 'true' : 'false'),
+
+        clearAll: () => {
+            localStorage.removeItem(CFG.STORAGE.HISTORY);
+            localStorage.removeItem(CFG.STORAGE.STATE);
+            localStorage.removeItem(CFG.STORAGE.OWNED);
+            localStorage.removeItem(CFG.STORAGE.ENEMIES);
+            localStorage.removeItem(CFG.STORAGE.CLEANED);
+            localStorage.removeItem(CFG.STORAGE.DB);
+            if (window.UI) window.UI.SuccessMessage('Memória de leitura e cache limpos com sucesso!');
+            setTimeout(() => location.reload(), 600);
+        }
     };
 
     // ==========================================
@@ -126,110 +134,253 @@
         delay: (min, max) => new Promise(res => setTimeout(res, Math.floor(Math.random() * (max - min + 1)) + min)),
         wrapBB: (text, type) => `[${type}]${text}[/${type}]`,
 
-        parseVillageFromTable: (tableId) => {
-            const tbl = document.getElementById(tableId);
+        parseVillageFromTable: (doc, tableId) => {
+            const tbl = doc.getElementById(tableId);
             if (!tbl) return null;
             const text = tbl.rows[1]?.cells[1]?.textContent.trim() || '';
             const match = text.match(/(.+?)\s*\((\d{3}\|\d{3})\)\s*K\d{2}/);
             return { name: match ? match[1].trim() : text, raw: text, coord: match ? match[2] : '---' };
         },
 
-        extractBuildings: () => {
+        extractVillageId: (doc, tableId) => {
+            const tbl = doc.getElementById(tableId);
+            if (!tbl) return null;
+            // 1. Verificar data-id no span da aldeia
+            const spanId = tbl.querySelector('span[data-id]')?.getAttribute('data-id');
+            if (spanId) return spanId;
+            // 2. Fallback: procurar link com id= da aldeia
+            const link = tbl.querySelector('a[href*="screen=info_village"]')?.getAttribute('href');
+            if (link) {
+                const m = link.match(/[?&]id=(\d+)/);
+                if (m) return m[1];
+            }
+            return null;
+        },
+
+        extractReportTime: (doc) => {
+            const bodyText = doc.body ? (doc.body.innerText || doc.body.textContent || '') : '';
+            // Procura "Tempo de batalha", "Enviado", ou "Data"
+            const match = bodyText.match(/(?:Tempo de batalha|Enviado|Data)\s*[:\n\r\t]*([0-9]{2}[\/\.][a-z0-9\.]+[\/\.][0-9]{2,4}\s*(?:\([0-9:]+\)|[0-9:]+))/i);
+            if (match) return match[1].trim();
+
+            const timeTd = doc.querySelector('#content_value table.vis tr td:last-child');
+            if (timeTd) {
+                const txt = timeTd.textContent.trim();
+                if (txt.length > 5 && txt.length < 50) return txt;
+            }
+            return '---';
+        },
+
+        extractBuildings: (doc) => {
             let wall = '?', farm = '?', tower = '?', hq = '?';
-            const container = document.getElementById('ra-left-wrapper') || document.getElementById('content_value');
+            const container = doc.getElementById('ra-left-wrapper') || doc.getElementById('content_value') || doc.body;
             const html = container ? container.innerHTML : '';
             const text = container ? (container.innerText || container.textContent) : '';
 
-            const wallMatch = html.match(/building wall.*?(\d+)/i) || text.match(/Muralha\s*(?:Nível\s*)?(\d+)/i);
-            const farmMatch = html.match(/building farm.*?(\d+)/i) || text.match(/Fazenda\s*(?:Nível\s*)?(\d+)/i);
-            const towerMatch = html.match(/building watchtower.*?(\d+)/i) || text.match(/Torre de vigia\s*(?:Nível\s*)?(\d+)/i);
-            const hqMatch = html.match(/building main.*?(\d+)/i) || text.match(/Edifício Principal\s*(?:Nível\s*)?(\d+)/i);
+            // Detectar dano de aríetes / catapultas (ex: "Muralha danificada do nível 11 para o nível 0")
+            const wallDmg = text.match(/Muralha danificada do nível \d+ para o nível (\d+)/i);
+            const farmDmg = text.match(/Fazenda danificada do nível \d+ para o nível (\d+)/i);
+            const towerDmg = text.match(/Torre de vigia danificada do nível \d+ para o nível (\d+)/i);
+            const hqDmg = text.match(/Edifício Principal danificado do nível \d+ para o nível (\d+)/i);
 
-            if (wallMatch) wall = wallMatch[1];
-            if (farmMatch) farm = farmMatch[1];
-            if (towerMatch) tower = towerMatch[1];
-            if (hqMatch) hq = hqMatch[1];
+            // Níveis por espionagem ou normais
+            const wallMatch = wallDmg ? wallDmg[1] : (html.match(/building wall.*?(\d+)/i) || text.match(/Muralha\s*(?:<b>)?\(?Nível\s*(\d+)/i));
+            const farmMatch = farmDmg ? farmDmg[1] : (html.match(/building farm.*?(\d+)/i) || text.match(/Fazenda\s*(?:<b>)?\(?Nível\s*(\d+)/i));
+            const towerMatch = towerDmg ? towerDmg[1] : (html.match(/building watchtower.*?(\d+)/i) || text.match(/Torre de vigia\s*(?:<b>)?\(?Nível\s*(\d+)/i));
+            const hqMatch = hqDmg ? hqDmg[1] : (html.match(/building main.*?(\d+)/i) || text.match(/Edifício Principal\s*(?:<b>)?\(?Nível\s*(\d+)/i));
+
+            if (wallMatch) wall = typeof wallMatch === 'string' ? wallMatch : wallMatch[1];
+            if (farmMatch) farm = typeof farmMatch === 'string' ? farmMatch : farmMatch[1];
+            if (towerMatch) tower = typeof towerMatch === 'string' ? towerMatch : towerMatch[1];
+            if (hqMatch) hq = typeof hqMatch === 'string' ? hqMatch : hqMatch[1];
 
             let loyalty = null;
             const loyaltyMatch = text.match(/Lealdade desceu de \d+ para (-?\d+)/i);
             if (loyaltyMatch) loyalty = parseInt(loyaltyMatch[1]);
 
             let troopsOutside = false;
-            const $awayTable = jQuery('#attack_spy_away');
-            if ($awayTable.length) {
-                $awayTable.find('tr').eq(1).find('td').each(function() {
-                    const count = parseInt(jQuery(this).text().trim().replace(/\./g, '')) || 0;
-                    if (count > 0) { troopsOutside = true; return false; }
+            const awayTable = doc.getElementById('attack_spy_away');
+            if (awayTable) {
+                const cells = awayTable.querySelectorAll('tr:nth-child(2) td');
+                cells.forEach(td => {
+                    const count = parseInt(td.textContent.trim().replace(/\./g, '')) || 0;
+                    if (count > 0) troopsOutside = true;
                 });
             }
 
-            const hasInfo = html.includes('Espionagem') || html.includes('attack_spy');
+            const hasInfo = html.includes('Espionagem') || html.includes('attack_spy') || !!doc.getElementById('attack_spy_buildings') || !!doc.getElementById('attack_spy_resources');
             return { wall, farm, tower, hq, loyalty, troopsOutside, hasInfo };
         },
 
-        buildFinalNote: (vData) => {
-            let finalNote = '';
-            if (vData.tags && vData.tags.length > 0) finalNote += `[b][u]TIPO DE ALDEIA[/u][/b]\n${vData.tags.join('\n')}\n\n`;
-            if (vData.spy && vData.spy.text) finalNote += `[b][u]ÚLTIMA ESPIONAGEM[/u][/b]\n${vData.spy.text}\n\n`;
+        extractUnits: (doc, tableSelector) => {
+            let nonSpyPop = 0, offPop = 0, defPop = 0, totalPop = 0, hasSnob = false;
+            const cells = doc.querySelectorAll(`${tableSelector} tr:nth-child(2) td.unit-item`);
 
-            if (vData.attacks && vData.attacks.length > 0) {
-                finalNote += `[b][u]HISTÓRICO DE ATAQUES (NOSSOS)[/u][/b]\n` + vData.attacks.map(a => a.text || a).join('\n\n---\n\n') + '\n\n';
+            cells.forEach((td, idx) => {
+                const count = parseInt(td.textContent.trim().replace(/\./g, '')) || 0;
+                // Extrair unidade da classe ex: unit-item unit-item-axe
+                const matchClass = td.className.match(/unit-item-([a-z]+)/);
+                const unit = matchClass ? matchClass[1] : (game_data.units ? game_data.units[idx] : null);
+                if (!unit || count === 0) return;
+
+                const pop = count * (CFG.UNITS.POP[unit] || 1);
+                if (unit !== 'spy') nonSpyPop += pop;
+                if (CFG.UNITS.OFF.includes(unit)) offPop += pop;
+                if (CFG.UNITS.DEF.includes(unit)) defPop += pop;
+                if (unit === 'snob') hasSnob = true;
+                totalPop += pop;
+            });
+
+            return { nonSpyPop, offPop, defPop, totalPop, hasSnob };
+        },
+
+        // Constrói e higieniza a nota para NUNCA exceder o limite de caracteres de Tribos
+        buildSanitizedNote: (vData, maxLength = CFG.MAX_NOTE_LENGTH) => {
+            const assemble = (includeSpoilers) => {
+                let note = '';
+                if (vData.tags && vData.tags.length > 0) {
+                    note += `[b][u]TIPO DE ALDEIA[/u][/b]\n${vData.tags.join('\n')}\n\n`;
+                }
+                if (vData.spy && vData.spy.text) {
+                    let spyText = vData.spy.text;
+                    if (!includeSpoilers) spyText = spyText.replace(/\[spoiler\][\s\S]*?\[\/spoiler\]/gi, '').trim();
+                    note += `[b][u]ÚLTIMA ESPIONAGEM[/u][/b]\n${spyText}\n\n`;
+                }
+                if (vData.attacks && vData.attacks.length > 0) {
+                    const attackTexts = vData.attacks.map((a, idx) => {
+                        let txt = a.text || a;
+                        const isLatest = (idx === vData.attacks.length - 1);
+                        if (!includeSpoilers || !isLatest) {
+                            txt = txt.replace(/\[spoiler\][\s\S]*?\[\/spoiler\]/gi, '').trim();
+                        }
+                        return txt;
+                    });
+                    note += `[b][u]HISTÓRICO DE ATAQUES (NOSSOS)[/u][/b]\n${attackTexts.join('\n\n---\n\n')}\n\n`;
+                }
+                if (vData.outgoing && vData.outgoing.length > 0) {
+                    const outTexts = vData.outgoing.map(a => a.text || a);
+                    note += `[b][u]ATAQUES LANÇADOS CONTRA NÓS[/u][/b]\n${outTexts.join('\n\n---\n\n')}\n\n`;
+                }
+                return note.trim();
+            };
+
+            // 1. Tentar com spoiler no ataque mais recente
+            let note = assemble(true);
+            if (note.length <= maxLength) return note;
+
+            // 2. Se for longo demais, remover spoilers para manter relatório leve
+            note = assemble(false);
+            if (note.length <= maxLength) return note;
+
+            // 3. Se continuar longo, descartar ataques mais antigos
+            const attacks = [...(vData.attacks || [])];
+            while (attacks.length > 1 && note.length > maxLength) {
+                attacks.shift();
+                vData.attacks = attacks;
+                note = assemble(false);
             }
-            if (vData.outgoing && vData.outgoing.length > 0) {
-                finalNote += `[b][u]ATAQUES LANÇADOS CONTRA NÓS[/u][/b]\n` + vData.outgoing.map(a => a.text || a).join('\n\n---\n\n') + '\n\n';
-            }
-            return finalNote.trim();
+            return note;
         }
     };
 
     // ==========================================
-    // 4. CLASSIFICADOR DE ALDEIAS
+    // 4. CLASSIFICADOR DE DEFESAS
     // ==========================================
     const TacticalEngine = {
-        analyzeDefense: () => {
-            let offPop = 0, defPop = 0, totalPop = 0, hasSnob = false;
+        analyzeDefense: (doc) => {
+            const defUnits = Utils.extractUnits(doc, '#attack_info_def_units');
+            const spyUnits = Utils.extractUnits(doc, '#attack_spy_def_troops');
 
-            const countPop = (idx, countText) => {
-                const count = parseInt(countText.replace(/\./g, '')) || 0;
-                const unit = game_data.units[idx];
-                if (unit && count > 0) {
-                    const pop = count * (CFG.UNITS.POP[unit] || 1);
-                    if (CFG.UNITS.OFF.includes(unit)) offPop += pop;
-                    if (CFG.UNITS.DEF.includes(unit)) defPop += pop;
-                    if (unit === 'snob') hasSnob = true;
-                    totalPop += pop;
-                }
-            };
-
-            jQuery('#attack_info_def tr').each(function() {
-                const $row = jQuery(this);
-                if ($row.find('td').eq(0).text().toLowerCase().includes('quantidade')) {
-                    $row.find('td').each(function(idx) {
-                        if (idx === 0) return;
-                        countPop(idx - 1, jQuery(this).text().trim());
-                    });
-                }
-            });
-
-            const $spyTbl = jQuery('#attack_spy_def_troops');
-            if ($spyTbl.length) {
-                $spyTbl.find('tr').eq(1).find('td').each(function(idx) { countPop(idx, jQuery(this).text().trim()); });
-            }
+            const totalOff = defUnits.offPop + spyUnits.offPop;
+            const totalDef = defUnits.defPop + spyUnits.defPop;
+            const hasSnob = defUnits.hasSnob || spyUnits.hasSnob;
 
             const tags = [];
             if (hasSnob) tags.push('🔴 [ALVO - CONTÉM NOBRES]');
-            if (offPop > CFG.HIGH_THREAT_POP) tags.push('💥 [FULL ATAQUE INIMIGO]');
-            else if (defPop > CFG.HIGH_THREAT_POP) tags.push('🛡️ [BUNKER / FULL DEFESA]');
-            else if (offPop > defPop * 1.5) tags.push('⚔️ [Aldeia Ofensiva]');
-            else if (defPop > offPop * 1.5) tags.push('🛡️ [Aldeia Defensiva]');
-            else if (offPop > 0 || defPop > 0) tags.push('⚖️ [Aldeia Mista]');
+            if (totalOff > CFG.HIGH_THREAT_POP) tags.push('💥 [FULL ATAQUE INIMIGO]');
+            else if (totalDef > CFG.HIGH_THREAT_POP) tags.push('🛡️ [BUNKER / FULL DEFESA]');
+            else if (totalOff > totalDef * 1.5) tags.push('⚔️ [Aldeia Ofensiva]');
+            else if (totalDef > totalOff * 1.5) tags.push('🛡️ [Aldeia Defensiva]');
+            else if (totalOff > 0 || totalDef > 0) tags.push('⚖️ [Aldeia Mista]');
 
-            return { tags, totalDefPop: totalPop };
+            return { tags, totalDefPop: defUnits.totalPop + spyUnits.totalPop };
         }
     };
 
     // ==========================================
-    // 5. INTERFACE DO UTILIZADOR
+    // 5. SERVIÇO DE NOTAS TRIBAL WARS (AJAX)
+    // ==========================================
+    const NoteService = {
+        // Envia a nota com proteção de timeout e fallback robusto
+        save: (villageId, noteText) => {
+            return new Promise((resolve) => {
+                let finished = false;
+                const finish = (success, msg) => {
+                    if (!finished) {
+                        finished = true;
+                        resolve({ success, msg });
+                    }
+                };
+
+                const timer = setTimeout(() => {
+                    console.warn(`[Gestor de Notas] Timeout ao gravar nota na aldeia ${villageId}`);
+                    finish(false, 'Tempo limite excedido ao gravar nota.');
+                }, 6000);
+
+                try {
+                    TribalWars.post(
+                        'info_village',
+                        { ajaxaction: 'edit_notes', id: villageId },
+                        { note: noteText },
+                        (res) => {
+                            clearTimeout(timer);
+                            finish(true, 'Nota guardada com sucesso.');
+                        },
+                        (err) => {
+                            clearTimeout(timer);
+                            console.warn('[Gestor de Notas] TribalWars.post retornou erro, tentando fallback:', err);
+                            // Fallback direto via jQuery.post com token CSRF
+                            const postUrl = TribalWars.buildURL
+                                ? TribalWars.buildURL('info_village', { ajaxaction: 'edit_notes', id: villageId })
+                                : `/game.php?village=${game_data.village.id}&screen=info_village&ajaxaction=edit_notes&id=${villageId}`;
+
+                            jQuery.post(postUrl, { note: noteText, h: game_data.csrf }, () => {
+                                finish(true, 'Nota guardada com sucesso via fallback.');
+                            }).fail((jqErr) => {
+                                finish(false, 'Falha ao guardar nota: ' + (err || jqErr?.statusText || 'Erro no servidor'));
+                            });
+                        }
+                    );
+                } catch (e) {
+                    clearTimeout(timer);
+                    console.error('[Gestor de Notas] Exceção ao chamar TribalWars.post:', e);
+                    finish(false, e.message);
+                }
+            });
+        },
+
+        // Verificação real-time do dono da aldeia com DOMParser
+        checkOwner: async (villageId) => {
+            return new Promise((resolve) => {
+                const url = `/game.php?village=${game_data.village.id}&screen=info_village&id=${villageId}`;
+                jQuery.get(url, (html) => {
+                    try {
+                        const doc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
+                        const playerLink = doc.querySelector('#content_value a[href*="screen=info_player"]') || doc.querySelector('a[href*="screen=info_player&id="]');
+                        const ownerIdMatch = playerLink ? playerLink.getAttribute('href').match(/[?&]id=(\d+)/) : null;
+                        const ownerId = ownerIdMatch ? ownerIdMatch[1] : null;
+                        const isOurs = (ownerId && String(ownerId) === String(game_data.player.id));
+                        resolve({ isOurs, ownerId });
+                    } catch (e) {
+                        resolve({ isOurs: false, ownerId: null });
+                    }
+                }).fail(() => resolve({ isOurs: false, ownerId: null }));
+            });
+        }
+    };
+
+    // ==========================================
+    // 6. INTERFACE DO UTILIZADOR
     // ==========================================
     const UI = {
         setupSidebarLayout: () => {
@@ -269,7 +420,7 @@
             let dashboard = document.getElementById('ra-notas-dashboard');
             if (!dashboard) {
                 const statusBadge = isSaved
-                    ? `<span style="color: green; font-weight: bold;">✔ Processado</span>`
+                    ? `<span style="color: green; font-weight: bold;">✔ Processado</span> <button id="btn-manual" class="btn" style="margin-top: 5px; width: 100%; font-size: 11px;">Reextrair Nota</button>`
                     : `<button id="btn-manual" class="btn" style="width:100%;">Extrair Nota</button>`;
 
                 const html = `
@@ -277,8 +428,9 @@
                         <tbody>
                             <tr>
                                 <th>
-                                    <div style="display: flex; justify-content: space-between;">
-                                        <span>Gestor de Notas TW v13.6</span>
+                                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                                        <span>Gestor de Notas TW v15.0</span>
+                                        <span style="font-size: 9px; color: #666;">PT114</span>
                                     </div>
                                 </th>
                             </tr>
@@ -286,21 +438,21 @@
                                 <td style="text-align: center; padding: 10px;">
                                     <strong>Estado da Leitura:</strong><br>
                                     <div id="action-container" style="margin-top: 5px;">${statusBadge}</div>
-                                    <div id="bot-progress-status" style="margin-top: 6px; font-size: 11px; color: #666;"></div>
+                                    <div id="bot-progress-status" style="margin-top: 6px; font-size: 11px; color: #555;"></div>
                                 </td>
                             </tr>
                             <tr>
                                 <th style="text-align: center;">Navegação Automática</th>
                             </tr>
                             <tr>
-                                <td style="padding: 10px; display: flex; flex-direction: column; gap: 5px;">
-                                    <button id="btn-auto-start" class="btn">▶ Iniciar Leitura Automática</button>
+                                <td style="padding: 10px; display: flex; flex-direction: column; gap: 6px;">
+                                    <button id="btn-auto-start" class="btn btn-default">▶ Iniciar Leitura Automática</button>
                                     <button id="btn-auto-stop" class="btn btn-cancel" style="display: none;">⏹ Parar Bot</button>
                                 </td>
                             </tr>
                             <tr>
                                 <td style="text-align: center; padding: 8px;">
-                                    <a href="#" id="btn-clear" style="font-size: 10px; color: #a52a2a;">🗑️ Limpar Memória de Leitura</a>
+                                    <a href="#" id="btn-clear" style="font-size: 11px; color: #a52a2a; text-decoration: underline;">🗑️ Limpar Memória e Cache</a>
                                 </td>
                             </tr>
                         </tbody>
@@ -310,9 +462,11 @@
                 sidebar.innerHTML = html;
 
                 document.getElementById('btn-manual')?.addEventListener('click', async (e) => {
-                    e.target.disabled = true;
-                    e.target.textContent = 'A processar...';
-                    await Engine.process(false);
+                    const btn = e.target;
+                    btn.disabled = true;
+                    btn.textContent = 'A processar...';
+                    await Engine.process(false, document);
+                    btn.disabled = false;
                 });
 
                 document.getElementById('btn-auto-start')?.addEventListener('click', async () => {
@@ -324,12 +478,14 @@
                 document.getElementById('btn-auto-stop')?.addEventListener('click', () => {
                     DB.setState(false);
                     UI.toggleAuto(false);
-                    UI.setStatus("⏹ Bot parado.");
+                    UI.setStatus("⏹ Bot interrompido pelo utilizador.");
                 });
 
                 document.getElementById('btn-clear')?.addEventListener('click', (e) => {
                     e.preventDefault();
-                    if (confirm("Redefinir memória de relatórios lidos?")) DB.clearHistory();
+                    if (confirm("Tens a certeza que queres limpar todo o histórico de leitura e caches de aldeias?")) {
+                        DB.clearAll();
+                    }
                 });
             }
 
@@ -349,45 +505,59 @@
         setStatus: (msg) => {
             const el = document.getElementById('bot-progress-status');
             if (el) el.innerHTML = msg;
+        },
+
+        setActionStatus: (htmlContent) => {
+            const el = document.getElementById('action-container');
+            if (el) el.innerHTML = htmlContent;
         }
     };
 
     // ==========================================
-    // 6. MOTOR DE PROCESSAMENTO
+    // 7. MOTOR DE PROCESSAMENTO
     // ==========================================
     const Engine = {
-        process: async (isAuto) => {
-            const reportId = Utils.getParam('view');
+        process: async (isAuto, targetDoc = document, reportIdOverride = null) => {
+            const reportId = reportIdOverride || Utils.getParam('view') || targetDoc.querySelector('a[href*="view="]')?.getAttribute('href')?.match(/[?&]view=(\d+)/)?.[1];
             const reportIdNum = parseInt(reportId, 10);
 
-            if (isAuto && DB.getHistory().includes(reportId)) {
+            if (isAuto && DB.getHistory().includes(String(reportId))) {
                 return 'already_read';
             }
 
-            const $attTable = jQuery('table#attack_info_att');
-            const $defTable = jQuery('table#attack_info_def');
-            if (!$defTable.length || !$attTable.length) {
+            const attTable = targetDoc.getElementById('attack_info_att');
+            const defTable = targetDoc.getElementById('attack_info_def');
+
+            if (!attTable || !defTable) {
                 DB.saveHistory(reportId);
-                if (!isAuto && window.UI) window.UI.ErrorMessage("Sem informações de batalha válidas.");
+                if (!isAuto && window.UI) window.UI.ErrorMessage("Sem informações de batalha válidas neste relatório.");
                 return 'no_battle';
             }
 
-            const attVillageId = $attTable.find('span[data-id]').first().attr('data-id');
-            const defVillageId = $defTable.find('span[data-id]').first().attr('data-id');
+            const attVillageId = Utils.extractVillageId(targetDoc, 'attack_info_att');
+            const defVillageId = Utils.extractVillageId(targetDoc, 'attack_info_def');
 
-            const attackerName = $attTable[0].rows[0].cells[1].textContent.trim();
-            const defenderName = $defTable[0].rows[0].cells[1].textContent.trim();
-            const isSelfAttack = (attackerName === game_data.player.name && defenderName === game_data.player.name);
+            // Detetar atacante e defensor
+            const attPlayerLink = attTable.querySelector('a[href*="screen=info_player"]');
+            const defPlayerLink = defTable.querySelector('a[href*="screen=info_player"]');
 
-            // Auto-ataque puro: as duas aldeias são nossas.
+            const attPlayerId = attPlayerLink?.getAttribute('href')?.match(/[?&]id=(\d+)/)?.[1] || null;
+            const defPlayerId = defPlayerLink?.getAttribute('href')?.match(/[?&]id=(\d+)/)?.[1] || null;
+
+            const attackerName = attTable.rows[0]?.cells[1]?.textContent.trim() || '';
+            const defenderName = defTable.rows[0]?.cells[1]?.textContent.trim() || '';
+
+            const isAttackerUs = (attPlayerId && String(attPlayerId) === String(game_data.player.id)) || (attackerName === game_data.player.name);
+            const isDefenderUs = (defPlayerId && String(defPlayerId) === String(game_data.player.id)) || (defenderName === game_data.player.name);
+            const isSelfAttack = (isAttackerUs && isDefenderUs);
+
+            // Auto-ataque: ambas as aldeias são nossas
             if (isSelfAttack) {
                 if (attVillageId) DB.addOwned(attVillageId);
                 if (defVillageId) DB.addOwned(defVillageId);
-
                 DB.saveHistory(reportId);
                 if (!isAuto) {
-                    const actionEl = document.getElementById('action-container');
-                    if (actionEl) actionEl.innerHTML = `<span style="color: gray; font-weight: bold;">Ignorado (Auto-Ataque)</span>`;
+                    UI.setActionStatus(`<span style="color: gray; font-weight: bold;">Ignorado (Auto-Ataque)</span>`);
                 }
                 return 'self_attack';
             }
@@ -396,20 +566,23 @@
             let focusVillageId = null;
             let isCounterIntel = false;
 
-            if (attackerName === game_data.player.name) {
-                focusVillageId = defVillageId; // Atacámos nós
-            } else if (defenderName === game_data.player.name) {
-                focusVillageId = attVillageId; // Defendemo-nos
+            if (isAttackerUs) {
+                focusVillageId = defVillageId; // Atacámos o inimigo
+            } else if (isDefenderUs) {
+                focusVillageId = attVillageId; // Inimigo atacou-nos (Counter-Intel)
                 isCounterIntel = true;
             } else {
                 focusVillageId = defVillageId;
             }
 
-            if (!focusVillageId) return 'no_focus';
+            if (!focusVillageId) {
+                if (!isAuto && window.UI) window.UI.ErrorMessage("Não foi possível identificar o ID da aldeia.");
+                return 'no_focus';
+            }
 
             // PASSO 1: Verificação em Tempo Real do Dono
-            const dataExt = Utils.extractBuildings();
-            const isConquest = (attackerName === game_data.player.name && dataExt.loyalty !== null && dataExt.loyalty <= 0);
+            const dataExt = Utils.extractBuildings(targetDoc);
+            const isConquest = (isAttackerUs && dataExt.loyalty !== null && dataExt.loyalty <= 0);
             let focusIsOurs = false;
 
             if (isConquest) {
@@ -420,12 +593,9 @@
             } else if (DB.getKnownEnemies().includes(focusVillageId)) {
                 focusIsOurs = false;
             } else {
-                focusIsOurs = await new Promise(resolve => {
-                    jQuery.get(`/game.php?screen=info_village&id=${focusVillageId}`, (html) => {
-                        const ownerLink = jQuery(html).find('#content_value table.vis:first tr:contains("Jogador:") a').attr('href');
-                        resolve(ownerLink && ownerLink.includes(`id=${game_data.player.id}`));
-                    }).fail(() => resolve(false));
-                });
+                // Consultar a aldeia no servidor para verificar o proprietário atual
+                const check = await NoteService.checkOwner(focusVillageId);
+                focusIsOurs = check.isOurs;
 
                 if (focusIsOurs) DB.addOwned(focusVillageId);
                 else DB.addKnownEnemy(focusVillageId);
@@ -434,63 +604,41 @@
             // PASSO 2: Aldeia Nossa -> Limpeza de notas antigas e bloqueio
             if (focusIsOurs) {
                 if (!DB.isCleaned(focusVillageId)) {
-                    await new Promise((resolve) => {
-                        jQuery.get(`/game.php?screen=info_village&id=${focusVillageId}`, (html) => {
-                            DB.markCleaned(focusVillageId);
-                            if (html.includes('TIPO DE ALDEIA') || html.includes('HISTÓRICO DE ATAQUES') || html.includes('ATAQUES LANÇADOS') || html.includes('ÚLTIMA ESPIONAGEM')) {
-                                DB.deleteVillage(focusVillageId);
-                                TribalWars.post('info_village', { ajaxaction: 'edit_notes', id: focusVillageId }, { note: "" }, () => resolve());
-                            } else {
-                                resolve();
-                            }
-                        }).fail(() => resolve());
-                    });
+                    DB.markCleaned(focusVillageId);
+                    DB.deleteVillage(focusVillageId);
+                    await NoteService.save(focusVillageId, '');
                 }
 
                 DB.saveHistory(reportId);
                 if (!isAuto) {
-                    const actionEl = document.getElementById('action-container');
-                    if (actionEl) actionEl.innerHTML = `<span style="color: #005eb2; font-weight: bold;">🏰 Aldeia Nossa (Limpa e Ignorada)</span>`;
+                    UI.setActionStatus(`<span style="color: #005eb2; font-weight: bold;">🏰 Aldeia Nossa (Limpa e Ignorada)</span>`);
+                    if (window.UI) window.UI.InfoMessage("Aldeia conquistada ou própria. Notas de ataque limpas.");
                 }
                 return 'cleaned';
             }
 
-            // PASSO 3: Aldeia Inimiga -> Construir e guardar nota tática
-            let reportTime = $defTable.closest('table').find('tr:eq(1) td:eq(1)').text().trim();
-            if (!reportTime || reportTime.length > 50) {
-                const timeTd = jQuery('#content_value table.vis:first tr:contains("Enviado"), #content_value table.vis:first tr:contains("Data")').find('td:last');
-                if (timeTd.length) reportTime = timeTd.text().trim();
-            }
-
-            let nonSpyPopAtt = 0, offPopAtt = 0, defPopAtt = 0;
-            jQuery('#attack_info_att_units tr:eq(1) td.unit-item').each(function(idx) {
-                const count = parseInt(this.textContent.trim().replace(/\./g, '')) || 0;
-                const unit = game_data.units[idx];
-                if (!unit || count === 0) return;
-
-                const pop = count * CFG.UNITS.POP[unit];
-                if (unit !== 'spy') nonSpyPopAtt += pop;
-                if (CFG.UNITS.OFF.includes(unit)) offPopAtt += pop;
-                if (CFG.UNITS.DEF.includes(unit)) defPopAtt += pop;
-            });
-            const isFake = nonSpyPopAtt < CFG.FAKE_LIMIT;
+            // PASSO 3: Aldeia Inimiga -> Extrair Tropas e Construir Nota
+            const reportTime = Utils.extractReportTime(targetDoc);
+            const attUnits = Utils.extractUnits(targetDoc, '#attack_info_att_units');
+            const isFake = attUnits.nonSpyPop < CFG.FAKE_LIMIT;
 
             if (isCounterIntel) {
-                const defData = Utils.parseVillageFromTable('attack_info_def');
+                // COUNTER-INTEL (Aldeia inimiga que nos atacou)
+                const defData = Utils.parseVillageFromTable(targetDoc, 'attack_info_def');
                 let block = `[b]Data:[/b] ${reportTime} | [b]Alvo:[/b] [coord]${defData ? defData.coord : '---'}[/coord]\n`;
 
                 if (isFake) {
                     block += `[i]🤡 Fake enviado contra nós[/i]\n`;
                 } else {
                     let inferredType = '⚖️ Mista';
-                    if (offPopAtt > defPopAtt * 1.5) inferredType = '⚔️ Ofensiva';
-                    else if (defPopAtt > offPopAtt * 1.5) inferredType = '🛡️ Defensiva';
+                    if (attUnits.offPop > attUnits.defPop * 1.5) inferredType = '⚔️ Ofensiva';
+                    else if (attUnits.defPop > attUnits.offPop * 1.5) inferredType = '🛡️ Defensiva';
 
-                    if (offPopAtt > 0) block += `[b]Off recebida:[/b] ${Utils.formatNum(offPopAtt)} | `;
-                    if (defPopAtt > 0) block += `[b]Def recebida:[/b] ${Utils.formatNum(defPopAtt)}\n`;
+                    if (attUnits.offPop > 0) block += `[b]Off recebida:[/b] ${Utils.formatNum(attUnits.offPop)} | `;
+                    if (attUnits.defPop > 0) block += `[b]Def recebida:[/b] ${Utils.formatNum(attUnits.defPop)}\n`;
                     block += `[b]Classificação Detetada:[/b] ${inferredType}\n`;
                 }
-                block += `[url="${window.location.origin}/game.php?screen=report&mode=all&view=${reportId}"]Link do Relatório[/url]`;
+                block += `[url="${window.location.origin}/game.php?village=${game_data.village.id}&screen=report&mode=all&view=${reportId}"]Link do Relatório[/url]`;
 
                 const vData = DB.getVillage(focusVillageId);
                 vData.outgoing = vData.outgoing || [];
@@ -500,31 +648,37 @@
                     .sort((a, b) => a.id - b.id)
                     .slice(-4);
 
-                const finalNote = Utils.buildFinalNote(vData);
+                const finalNote = Utils.buildSanitizedNote(vData);
                 DB.saveVillage(focusVillageId, vData);
 
-                await new Promise((resolve) => {
-                    TribalWars.post('info_village', { ajaxaction: 'edit_notes', id: focusVillageId }, { note: finalNote }, () => {
-                        DB.saveHistory(reportId);
-                        if (!isAuto) {
-                            const actionEl = document.getElementById('action-container');
-                            if (actionEl) actionEl.innerHTML = `<span style="color: green; font-weight: bold;">✔ Counter-Intel Guardada</span>`;
-                        }
-                        resolve();
-                    });
-                });
-                return 'saved';
+                const saveRes = await NoteService.save(focusVillageId, finalNote);
+                if (saveRes.success) {
+                    DB.saveHistory(reportId);
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: green; font-weight: bold;">✔ Counter-Intel Guardada</span>`);
+                        if (window.UI) window.UI.SuccessMessage('Counter-Intel guardada na aldeia inimiga!');
+                    }
+                    return 'saved';
+                } else {
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: red; font-weight: bold;">❌ Erro ao Gravar</span>`);
+                        if (window.UI) window.UI.ErrorMessage('Erro ao gravar nota: ' + saveRes.msg);
+                    }
+                    return 'error';
+                }
             } else {
+                // ATAQUE NOSSO CONTRA ALDEIA INIMIGA
                 const hasSpyInfo = dataExt.hasInfo;
-                const tacticalData = TacticalEngine.analyzeDefense();
+                const tacticalData = TacticalEngine.analyzeDefense(targetDoc);
                 const playerBB = Utils.wrapBB(defenderName, 'player');
 
                 let block = `[b]Data:[/b] ${reportTime} | [b]Dono:[/b] ${playerBB}\n`;
-                if (isFake) block += `[i]Ataque Falso / Espionagem[/i]\n`;
-                else {
-                    if (offPopAtt > 0) block += `[b]Off enviada:[/b] ${Utils.formatNum(offPopAtt)} | `;
-                    if (defPopAtt > 0) block += `[b]Def enviada:[/b] ${Utils.formatNum(defPopAtt)}\n`;
-                    if (offPopAtt > 0 && defPopAtt === 0) block += `\n`;
+                if (isFake) {
+                    block += `[i]Ataque Falso / Espionagem[/i]\n`;
+                } else {
+                    if (attUnits.offPop > 0) block += `[b]Off enviada:[/b] ${Utils.formatNum(attUnits.offPop)} | `;
+                    if (attUnits.defPop > 0) block += `[b]Def enviada:[/b] ${Utils.formatNum(attUnits.defPop)}\n`;
+                    if (attUnits.offPop > 0 && attUnits.defPop === 0) block += `\n`;
                 }
 
                 if (hasSpyInfo) {
@@ -533,14 +687,22 @@
                     if (dataExt.hq !== '?') block += ` | [b]EP:[/b] ${dataExt.hq}`;
                     block += `\n`;
                     if (dataExt.troopsOutside) block += `[b]⚠️ Contém tropas fora da aldeia[/b]\n`;
+                } else if (dataExt.wall !== '?') {
+                    block += `[b]Muralha:[/b] ${dataExt.wall}\n`;
                 }
+
                 if (dataExt.loyalty !== null) {
                     block += `[b]📉 Lealdade:[/b] ${dataExt.loyalty}\n`;
                 }
 
-                const $export = $('#report_export_code');
-                if ($export.length) block += '\n' + $export.html().trim() + '\n';
-                block += `[url="${window.location.origin}/game.php?screen=report&mode=all&view=${reportId}"]Link do Relatório[/url]`;
+                // Export code do relatório (se existir)
+                const exportEl = targetDoc.getElementById('report_export_code');
+                const exportCode = exportEl ? (exportEl.value || exportEl.innerHTML || '').trim() : '';
+                if (exportCode) {
+                    block += '\n' + exportCode + '\n';
+                }
+
+                block += `[url="${window.location.origin}/game.php?village=${game_data.village.id}&screen=report&mode=all&view=${reportId}"]Link do Relatório[/url]`;
 
                 const vData = DB.getVillage(focusVillageId);
                 if (tacticalData.tags.length > 0) vData.tags = tacticalData.tags;
@@ -560,48 +722,57 @@
                     vData.spy = { id: reportIdNum, text: block };
                 }
 
-                const finalNote = Utils.buildFinalNote(vData);
+                // Se em modo automático e não há nada de relevante (fake sem espionagem), ignorar
+                if (isAuto && isFake && !hasSpyInfo) {
+                    DB.saveHistory(reportId);
+                    return 'skipped';
+                }
 
-                if (!finalNote.trim() || (isFake && !hasSpyInfo)) {
+                const finalNote = Utils.buildSanitizedNote(vData);
+
+                if (!finalNote.trim()) {
                     DB.saveHistory(reportId);
                     if (!isAuto) {
-                        const actionEl = document.getElementById('action-container');
-                        if (actionEl) actionEl.innerHTML = `<span style="color: gray; font-weight: bold;">Lido (Sem info relevante)</span>`;
+                        UI.setActionStatus(`<span style="color: gray; font-weight: bold;">Lido (Sem info relevante)</span>`);
                     }
                     return 'skipped';
                 }
 
                 DB.saveVillage(focusVillageId, vData);
 
-                await new Promise((resolve) => {
-                    TribalWars.post('info_village', { ajaxaction: 'edit_notes', id: focusVillageId }, { note: finalNote }, () => {
-                        DB.saveHistory(reportId);
-                        if (!isAuto) {
-                            const actionEl = document.getElementById('action-container');
-                            if (actionEl) actionEl.innerHTML = `<span style="color: green; font-weight: bold;">✔ Nota Guardada</span>`;
-                        }
-                        resolve();
-                    });
-                });
-                return 'saved';
+                const saveRes = await NoteService.save(focusVillageId, finalNote);
+                if (saveRes.success) {
+                    DB.saveHistory(reportId);
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: green; font-weight: bold;">✔ Nota Guardada</span>`);
+                        if (window.UI) window.UI.SuccessMessage('Nota guardada na aldeia alvo!');
+                    }
+                    return 'saved';
+                } else {
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: red; font-weight: bold;">❌ Erro ao Gravar</span>`);
+                        if (window.UI) window.UI.ErrorMessage('Erro ao gravar nota: ' + saveRes.msg);
+                    }
+                    return 'error';
+                }
             }
         },
 
         runAutoLoop: async () => {
             let count = 0;
             let saved = 0;
+            let currentReportId = Utils.getParam('view') || document.querySelector('a[href*="view="]')?.getAttribute('href')?.match(/[?&]view=(\d+)/)?.[1];
 
             while (DB.isRunning()) {
-                const reportId = Utils.getParam('view');
-                if (!reportId) {
+                if (!currentReportId) {
                     DB.setState(false);
                     UI.toggleAuto(false);
                     break;
                 }
 
-                UI.setStatus(`Lendo relatório #${reportId}... [Lidos: ${count} | Salvos: ${saved}]`);
+                UI.setStatus(`A ler relatório #${currentReportId}... [Lidos: ${count} | Salvos: ${saved}]`);
 
-                const res = await Engine.process(true);
+                const res = await Engine.process(true, document, currentReportId);
                 count++;
                 if (res === 'saved') saved++;
 
@@ -609,14 +780,32 @@
 
                 if (!DB.isRunning()) break;
 
-                const nextBtn = document.getElementById('report-previous') || document.getElementById('report-prev');
-                const nextHref = nextBtn ? nextBtn.getAttribute('href') : null;
+                // Encontrar o botão do relatório seguinte (mais antigo)
+                const nextBtn = document.getElementById('report-prev') || document.getElementById('report-previous') || document.querySelector('a.report-nav-btn[data-direction="prev"]');
 
-                if (!nextHref) {
+                let nextUrl = null;
+                let nextReportId = null;
+                if (nextBtn) {
+                    const nextId = nextBtn.getAttribute('data-id');
+                    if (nextId) {
+                        nextReportId = nextId;
+                        const mode = Utils.getParam('mode') || 'all';
+                        const group = Utils.getParam('group_id') || '0';
+                        nextUrl = `/game.php?village=${game_data.village.id}&screen=report&mode=${mode}&group_id=${group}&view=${nextId}`;
+                    } else {
+                        const href = nextBtn.getAttribute('href');
+                        if (href && href !== '#' && href.includes('view=')) {
+                            nextUrl = href;
+                            nextReportId = Utils.getParam('view', href);
+                        }
+                    }
+                }
+
+                if (!nextUrl || !nextReportId) {
                     DB.setState(false);
                     UI.toggleAuto(false);
                     UI.setStatus(`✔ Concluído! [Lidos: ${count} | Salvos: ${saved}]`);
-                    if (window.UI) window.UI.SuccessMessage('Leitura da pasta concluída.');
+                    if (window.UI) window.UI.SuccessMessage(`Leitura da pasta concluída! Total verificados: ${count} | Notas guardadas: ${saved}`);
                     break;
                 }
 
@@ -624,23 +813,27 @@
                 if (!DB.isRunning()) break;
 
                 try {
-                    const html = await jQuery.get(nextHref);
-                    const $newDoc = jQuery(html);
-                    const newContent = $newDoc.find('#content_value').html();
+                    const html = await jQuery.get(nextUrl);
+                    const doc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
+                    const newContent = doc.querySelector('#content_value');
 
                     if (newContent) {
                         const leftWrapper = document.getElementById('ra-left-wrapper');
-                        if (leftWrapper) leftWrapper.innerHTML = newContent;
+                        if (leftWrapper) {
+                            leftWrapper.innerHTML = newContent.innerHTML;
+                        }
                     }
 
+                    currentReportId = nextReportId;
+
                     if (window.history && window.history.replaceState) {
-                        window.history.replaceState(null, '', nextHref);
+                        window.history.replaceState(null, '', nextUrl);
                     }
                 } catch (e) {
                     console.error("[Gestor de Notas] Erro ao carregar relatório:", e);
                     DB.setState(false);
                     UI.toggleAuto(false);
-                    if (window.UI) window.UI.ErrorMessage("Erro ao carregar o próximo relatório.");
+                    if (window.UI) window.UI.ErrorMessage("Erro ao carregar o próximo relatório via AJAX.");
                     break;
                 }
             }
@@ -648,30 +841,35 @@
     };
 
     // ==========================================
-    // 7. RENDERIZAR NOTAS (Ecrã de Comando)
+    // 8. RENDERIZAR NOTAS (Ecrã de Comando)
     // ==========================================
     const renderVillageNotes = () => {
         const anchor = document.querySelector('.village_anchor a');
         if (!anchor) return;
 
         jQuery.get(anchor.getAttribute('href'), (html) => {
-            const noteHtml = jQuery(html).find('#own_village_note .village-note');
-            if (noteHtml.length && !document.getElementById('ra-notas-cmd-box')) {
-                const container = `
-                    <table id="ra-notas-cmd-box" class="vis" style="width: 100%; margin-top: 15px;">
-                        <tbody>
-                            <tr><th>Dados Registados (Gestor de Notas)</th></tr>
-                            <tr><td style="padding: 10px;">${noteHtml[0].children[1].innerHTML}</td></tr>
-                        </tbody>
-                    </table>
-                `;
-                document.querySelector('#content_value table')?.insertAdjacentHTML('afterend', container);
+            try {
+                const doc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
+                const noteElem = doc.querySelector('#own_village_note .village-note, #village_notes .village-note, .village-note');
+                if (noteElem && !document.getElementById('ra-notas-cmd-box')) {
+                    const container = `
+                        <table id="ra-notas-cmd-box" class="vis" style="width: 100%; margin-top: 15px;">
+                            <tbody>
+                                <tr><th>Dados Registados (Gestor de Notas)</th></tr>
+                                <tr><td style="padding: 10px;">${noteElem.innerHTML}</td></tr>
+                            </tbody>
+                        </table>
+                    `;
+                    document.querySelector('#content_value table')?.insertAdjacentHTML('afterend', container);
+                }
+            } catch (e) {
+                console.error('[Gestor de Notas] Erro ao renderizar notas de comando:', e);
             }
         });
     };
 
     // ==========================================
-    // 8. INICIALIZAÇÃO
+    // 9. INICIALIZAÇÃO
     // ==========================================
     const init = () => {
         const screen = Utils.getParam('screen');
@@ -679,10 +877,11 @@
         const id = Utils.getParam('id');
 
         if (screen === 'report' && view) {
-            UI.renderDashboard(view, DB.getHistory().includes(view));
+            UI.renderDashboard(view, DB.getHistory().includes(String(view)));
         } else if (screen === 'report' && !view) {
             const firstReport = document.querySelector('table#report_list a[href*="view="]');
             if (firstReport) {
+                if (window.UI) window.UI.InfoMessage("A abrir o primeiro relatório da lista...");
                 firstReport.click();
             } else {
                 if (window.UI) window.UI.InfoMessage("Abre um relatório da pasta e clica novamente no script.");
