@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto Set/Get Village Notes (Gestor de Notas TW - Barra de Acesso Rápido)
 // @namespace    http://tampermonkey.net/
-// @version      15.0
+// @version      16.0
 // @description  Verificação em tempo real do dono atual (ignora aldeias tuas mesmo em relatórios antigos) e limpeza definitiva. Adaptado para Barra de Acesso Rápido com navegação contínua AJAX e controlo rigoroso de tamanho de nota.
 // @author       RedAlert (Mod: JawJaw / Refatorado para Barra Rápida)
 // ==/UserScript==
@@ -19,12 +19,12 @@
         MAX_NOTE_LENGTH: 4200, // Limite seguro para evitar rejeição do servidor TW (limite max: 5000)
         DELAYS: { MIN: 200, MAX: 400 },
         STORAGE: {
-            HISTORY: `tw_notas_history_${game_data.world}`,
+            HISTORY: `tw_notas_v2_history_${game_data.world}`,
             STATE: `tw_notas_running_${game_data.world}`,
-            DB: `tw_notas_db_${game_data.world}`,
-            OWNED: `tw_notas_owned_${game_data.world}`,
-            ENEMIES: `tw_notas_enemies_${game_data.world}`,
-            CLEANED: `tw_notas_cleaned_${game_data.world}`
+            DB: `tw_notas_v2_db_${game_data.world}`,
+            OWNED: `tw_notas_v2_owned_${game_data.world}`,
+            ENEMIES: `tw_notas_v2_enemies_${game_data.world}`,
+            CLEANED: `tw_notas_v2_cleaned_${game_data.world}`
         },
         UNITS: {
             POP: { spear: 1, sword: 1, axe: 1, archer: 1, spy: 2, light: 4, marcher: 5, heavy: 6, ram: 5, catapult: 8, knight: 10, snob: 100, militia: 0 },
@@ -366,10 +366,20 @@
                 jQuery.get(url, (html) => {
                     try {
                         const doc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
-                        const playerLink = doc.querySelector('#content_value a[href*="screen=info_player"]') || doc.querySelector('a[href*="screen=info_player&id="]');
-                        const ownerIdMatch = playerLink ? playerLink.getAttribute('href').match(/[?&]id=(\d+)/) : null;
-                        const ownerId = ownerIdMatch ? ownerIdMatch[1] : null;
-                        const isOurs = (ownerId && String(ownerId) === String(game_data.player.id));
+                        const rows = doc.querySelectorAll('#content_value table.vis tr');
+                        let ownerId = null;
+                        for (const tr of rows) {
+                            const text = tr.textContent;
+                            if (text.includes('Jogador:') || text.includes('Player:')) {
+                                const a = tr.querySelector('a[href*="screen=info_player"]');
+                                if (a) {
+                                    const m = a.getAttribute('href').match(/[?&]id=(\d+)/);
+                                    if (m) ownerId = m[1];
+                                }
+                                break;
+                            }
+                        }
+                        const isOurs = (ownerId !== null && String(ownerId) === String(game_data.player.id));
                         resolve({ isOurs, ownerId });
                     } catch (e) {
                         resolve({ isOurs: false, ownerId: null });
@@ -429,7 +439,7 @@
                             <tr>
                                 <th>
                                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                                        <span>Gestor de Notas TW v15.0</span>
+                                        <span>Gestor de Notas TW v16.0</span>
                                         <span style="font-size: 9px; color: #666;">PT114</span>
                                     </div>
                                 </th>
@@ -667,14 +677,15 @@
                     return 'error';
                 }
             } else {
-                // ATAQUE NOSSO CONTRA ALDEIA INIMIGA
+                // ATAQUE NOSSO CONTRA ALDEIA INIMIGA OU BÁRBARA
                 const hasSpyInfo = dataExt.hasInfo;
                 const tacticalData = TacticalEngine.analyzeDefense(targetDoc);
-                const playerBB = Utils.wrapBB(defenderName, 'player');
+                const isBarbarian = !defenderName || defenderName === '---' || defenderName.toLowerCase().includes('bárbar');
+                const playerBB = isBarbarian ? '---' : Utils.wrapBB(defenderName, 'player');
 
                 let block = `[b]Data:[/b] ${reportTime} | [b]Dono:[/b] ${playerBB}\n`;
                 if (isFake) {
-                    block += `[i]Ataque Falso / Espionagem[/i]\n`;
+                    block += `[i]Saque / Ataque Pequeno[/i]\n`;
                 } else {
                     if (attUnits.offPop > 0) block += `[b]Off enviada:[/b] ${Utils.formatNum(attUnits.offPop)} | `;
                     if (attUnits.defPop > 0) block += `[b]Def enviada:[/b] ${Utils.formatNum(attUnits.defPop)}\n`;
@@ -707,25 +718,16 @@
                 const vData = DB.getVillage(focusVillageId);
                 if (tacticalData.tags.length > 0) vData.tags = tacticalData.tags;
 
-                if (!isFake) {
-                    vData.attacks = vData.attacks || [];
-                    vData.attacks.push({ id: reportIdNum, text: block });
-                    vData.attacks = vData.attacks
-                        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
-                        .sort((a, b) => a.id - b.id)
-                        .slice(-4);
+                // Registo de ataques: registar sempre na aldeia foco (saque, fake ou ataque normal)
+                vData.attacks = vData.attacks || [];
+                vData.attacks.push({ id: reportIdNum, text: block });
+                vData.attacks = vData.attacks
+                    .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+                    .sort((a, b) => a.id - b.id)
+                    .slice(-4);
 
-                    if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
-                        vData.spy = { id: reportIdNum, text: block };
-                    }
-                } else if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
+                if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
                     vData.spy = { id: reportIdNum, text: block };
-                }
-
-                // Se em modo automático e não há nada de relevante (fake sem espionagem), ignorar
-                if (isAuto && isFake && !hasSpyInfo) {
-                    DB.saveHistory(reportId);
-                    return 'skipped';
                 }
 
                 const finalNote = Utils.buildSanitizedNote(vData);
@@ -762,6 +764,7 @@
             let count = 0;
             let saved = 0;
             let currentReportId = Utils.getParam('view') || document.querySelector('a[href*="view="]')?.getAttribute('href')?.match(/[?&]view=(\d+)/)?.[1];
+            let currentDoc = document;
 
             while (DB.isRunning()) {
                 if (!currentReportId) {
@@ -770,18 +773,18 @@
                     break;
                 }
 
-                UI.setStatus(`A ler relatório #${currentReportId}... [Lidos: ${count} | Salvos: ${saved}]`);
+                UI.setStatus(`A ler relatório #${currentReportId}... [Lidos: ${count} | Guardados: ${saved}]`);
 
-                const res = await Engine.process(true, document, currentReportId);
+                const res = await Engine.process(true, currentDoc, currentReportId);
                 count++;
                 if (res === 'saved') saved++;
 
-                UI.setStatus(`Lidos: ${count} | Notas Guardadas: ${saved}`);
+                UI.setStatus(`Lidos: ${count} | Guardados: ${saved}`);
 
                 if (!DB.isRunning()) break;
 
-                // Encontrar o botão do relatório seguinte (mais antigo)
-                const nextBtn = document.getElementById('report-prev') || document.getElementById('report-previous') || document.querySelector('a.report-nav-btn[data-direction="prev"]');
+                // Encontrar o botão do relatório seguinte (mais antigo) a partir do DOM atual
+                const nextBtn = currentDoc.getElementById('report-prev') || currentDoc.getElementById('report-previous') || currentDoc.querySelector('a.report-nav-btn[data-direction="prev"]');
 
                 let nextUrl = null;
                 let nextReportId = null;
@@ -801,10 +804,10 @@
                     }
                 }
 
-                if (!nextUrl || !nextReportId) {
+                if (!nextUrl || !nextReportId || String(nextReportId) === String(currentReportId)) {
                     DB.setState(false);
                     UI.toggleAuto(false);
-                    UI.setStatus(`✔ Concluído! [Lidos: ${count} | Salvos: ${saved}]`);
+                    UI.setStatus(`✔ Concluído! [Lidos: ${count} | Guardados: ${saved}]`);
                     if (window.UI) window.UI.SuccessMessage(`Leitura da pasta concluída! Total verificados: ${count} | Notas guardadas: ${saved}`);
                     break;
                 }
@@ -814,8 +817,8 @@
 
                 try {
                     const html = await jQuery.get(nextUrl);
-                    const doc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
-                    const newContent = doc.querySelector('#content_value');
+                    const newDoc = new (window.DOMParser || DOMParser)().parseFromString(html, 'text/html');
+                    const newContent = newDoc.querySelector('#content_value');
 
                     if (newContent) {
                         const leftWrapper = document.getElementById('ra-left-wrapper');
@@ -824,6 +827,7 @@
                         }
                     }
 
+                    currentDoc = newDoc;
                     currentReportId = nextReportId;
 
                     if (window.history && window.history.replaceState) {
