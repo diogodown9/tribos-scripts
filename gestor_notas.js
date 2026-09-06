@@ -380,11 +380,12 @@
                             }
                         }
                         const isOurs = (ownerId !== null && String(ownerId) === String(game_data.player.id));
-                        resolve({ isOurs, ownerId });
+                        const isBarbarian = (ownerId === null);
+                        resolve({ isOurs, isBarbarian, ownerId });
                     } catch (e) {
-                        resolve({ isOurs: false, ownerId: null });
+                        resolve({ isOurs: false, isBarbarian: false, ownerId: null });
                     }
-                }).fail(() => resolve({ isOurs: false, ownerId: null }));
+                }).fail(() => resolve({ isOurs: false, isBarbarian: false, ownerId: null }));
             });
         }
     };
@@ -572,15 +573,29 @@
                 return 'self_attack';
             }
 
-            // Identificar aldeia foco
+            // Identificar aldeia foco e ignorar aldeias bárbaras (notas aplicam-se apenas a jogadores)
             let focusVillageId = null;
             let isCounterIntel = false;
 
             if (isAttackerUs) {
-                focusVillageId = defVillageId; // Atacámos o inimigo
+                focusVillageId = defVillageId; // Atacámos o alvo
+                const isBarbarianReport = !defPlayerLink || !defenderName || defenderName === '---' || defenderName.toLowerCase().includes('bárbar') || defenderName.toLowerCase().includes('barbar');
+                if (isBarbarianReport) {
+                    DB.saveHistory(reportId);
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: gray; font-weight: bold;">Ignorado (Aldeia Bárbara)</span>`);
+                        if (window.UI) window.UI.InfoMessage("Aldeia bárbara ignorada — notas aplicam-se apenas a jogadores.");
+                    }
+                    return 'barbarian';
+                }
             } else if (isDefenderUs) {
                 focusVillageId = attVillageId; // Inimigo atacou-nos (Counter-Intel)
                 isCounterIntel = true;
+                const isBarbarianAttacker = !attPlayerLink || !attackerName || attackerName === '---' || attackerName.toLowerCase().includes('bárbar');
+                if (isBarbarianAttacker) {
+                    DB.saveHistory(reportId);
+                    return 'barbarian';
+                }
             } else {
                 focusVillageId = defVillageId;
             }
@@ -605,8 +620,16 @@
             } else {
                 // Consultar a aldeia no servidor para verificar o proprietário atual
                 const check = await NoteService.checkOwner(focusVillageId);
-                focusIsOurs = check.isOurs;
+                if (check.isBarbarian) {
+                    DB.saveHistory(reportId);
+                    if (!isAuto) {
+                        UI.setActionStatus(`<span style="color: gray; font-weight: bold;">Ignorado (Aldeia Bárbara)</span>`);
+                        if (window.UI) window.UI.InfoMessage("Aldeia bárbara ignorada — notas aplicam-se apenas a jogadores.");
+                    }
+                    return 'barbarian';
+                }
 
+                focusIsOurs = check.isOurs;
                 if (focusIsOurs) DB.addOwned(focusVillageId);
                 else DB.addKnownEnemy(focusVillageId);
             }
@@ -677,15 +700,14 @@
                     return 'error';
                 }
             } else {
-                // ATAQUE NOSSO CONTRA ALDEIA INIMIGA OU BÁRBARA
+                // ATAQUE NOSSO CONTRA ALDEIA DE JOGADOR INIMIGO
                 const hasSpyInfo = dataExt.hasInfo;
                 const tacticalData = TacticalEngine.analyzeDefense(targetDoc);
-                const isBarbarian = !defenderName || defenderName === '---' || defenderName.toLowerCase().includes('bárbar');
-                const playerBB = isBarbarian ? '---' : Utils.wrapBB(defenderName, 'player');
+                const playerBB = Utils.wrapBB(defenderName, 'player');
 
                 let block = `[b]Data:[/b] ${reportTime} | [b]Dono:[/b] ${playerBB}\n`;
                 if (isFake) {
-                    block += `[i]Saque / Ataque Pequeno[/i]\n`;
+                    block += `[i]Ataque Falso / Espionagem[/i]\n`;
                 } else {
                     if (attUnits.offPop > 0) block += `[b]Off enviada:[/b] ${Utils.formatNum(attUnits.offPop)} | `;
                     if (attUnits.defPop > 0) block += `[b]Def enviada:[/b] ${Utils.formatNum(attUnits.defPop)}\n`;
@@ -718,16 +740,30 @@
                 const vData = DB.getVillage(focusVillageId);
                 if (tacticalData.tags.length > 0) vData.tags = tacticalData.tags;
 
-                // Registo de ataques: registar sempre na aldeia foco (saque, fake ou ataque normal)
-                vData.attacks = vData.attacks || [];
-                vData.attacks.push({ id: reportIdNum, text: block });
-                vData.attacks = vData.attacks
-                    .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
-                    .sort((a, b) => a.id - b.id)
-                    .slice(-4);
+                if (!isFake) {
+                    vData.attacks = vData.attacks || [];
+                    vData.attacks.push({ id: reportIdNum, text: block });
+                    vData.attacks = vData.attacks
+                        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+                        .sort((a, b) => a.id - b.id)
+                        .slice(-4);
 
-                if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
+                    if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
+                        vData.spy = { id: reportIdNum, text: block };
+                    }
+                } else if (hasSpyInfo && (!vData.spy || reportIdNum > vData.spy.id)) {
                     vData.spy = { id: reportIdNum, text: block };
+                }
+
+                // Se em modo automático e for um fake puro sem informação útil (sem espionagem, sem dano, sem tropas detetadas), ignorar
+                const hasWallDmg = dataExt.wall !== '?';
+                const hasDefTroops = tacticalData.totalDefPop > 0;
+                const isConquestProgress = dataExt.loyalty !== null;
+                const isRelevantAttack = (!isFake) || hasSpyInfo || hasWallDmg || hasDefTroops || isConquestProgress;
+
+                if (isAuto && !isRelevantAttack) {
+                    DB.saveHistory(reportId);
+                    return 'skipped';
                 }
 
                 const finalNote = Utils.buildSanitizedNote(vData);
@@ -763,6 +799,7 @@
         runAutoLoop: async () => {
             let count = 0;
             let saved = 0;
+            let barbs = 0;
             let currentReportId = Utils.getParam('view') || document.querySelector('a[href*="view="]')?.getAttribute('href')?.match(/[?&]view=(\d+)/)?.[1];
             let currentDoc = document;
 
@@ -773,13 +810,14 @@
                     break;
                 }
 
-                UI.setStatus(`A ler relatório #${currentReportId}... [Lidos: ${count} | Guardados: ${saved}]`);
+                UI.setStatus(`A ler relatório #${currentReportId}... [Lidos: ${count} | Players: ${saved} | Bárbaras: ${barbs}]`);
 
                 const res = await Engine.process(true, currentDoc, currentReportId);
                 count++;
                 if (res === 'saved') saved++;
+                else if (res === 'barbarian') barbs++;
 
-                UI.setStatus(`Lidos: ${count} | Guardados: ${saved}`);
+                UI.setStatus(`Lidos: ${count} | Notas em Players: ${saved} | Bárbaras ignoradas: ${barbs}`);
 
                 if (!DB.isRunning()) break;
 
@@ -807,8 +845,8 @@
                 if (!nextUrl || !nextReportId || String(nextReportId) === String(currentReportId)) {
                     DB.setState(false);
                     UI.toggleAuto(false);
-                    UI.setStatus(`✔ Concluído! [Lidos: ${count} | Guardados: ${saved}]`);
-                    if (window.UI) window.UI.SuccessMessage(`Leitura da pasta concluída! Total verificados: ${count} | Notas guardadas: ${saved}`);
+                    UI.setStatus(`✔ Concluído! [Lidos: ${count} | Notas em Players: ${saved} | Bárbaras ignoradas: ${barbs}]`);
+                    if (window.UI) window.UI.SuccessMessage(`Leitura da pasta concluída! Total verificados: ${count} | Notas em Players: ${saved} | Bárbaras ignoradas: ${barbs}`);
                     break;
                 }
 
